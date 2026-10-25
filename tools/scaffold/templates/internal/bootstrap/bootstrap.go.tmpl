@@ -1,0 +1,328 @@
+// Package bootstrap wires [[.Name]]'s dependencies and run modes.
+//
+// Dependencies are created lazily and at most once, so each run mode only
+// connects to what it uses (the relay never opens the HTTP port, the API
+// never joins a consumer group) and "all" can share them.
+package bootstrap
+
+import (
+	"context"
+	"sync"
+	"time"
+
+	"[[.Module]]/platform/app"
+	"[[.Module]]/platform/auth"
+	"[[.Module]]/platform/httpserver"
+[[- if .Redis]]
+	"[[.Module]]/platform/idempotency"
+	"[[.Module]]/platform/redis"
+[[- end]]
+[[- if .Kafka]]
+	"[[.Module]]/platform/kafka"
+[[- end]]
+[[- if and .Kafka .HasDB]]
+	"[[.Module]]/platform/outbox"
+[[- end]]
+[[- if eq .DB "postgres"]]
+[[- if .Kafka]]
+	"[[.Module]]/platform/outbox/pgoutbox"
+[[- end]]
+	"[[.Module]]/platform/postgres"
+[[- end]]
+[[- if eq .DB "mongo"]]
+[[- if .Kafka]]
+	"[[.Module]]/platform/outbox/mongooutbox"
+[[- end]]
+	pmongo "[[.Module]]/platform/mongo"
+[[- end]]
+
+	"[[.Module]]/services/[[.Name]]/internal/api"
+	"[[.Module]]/services/[[.Name]]/internal/config"
+[[- if .Kafka]]
+	"[[.Module]]/services/[[.Name]]/internal/consumer"
+	"[[.Module]]/services/[[.Name]]/internal/events"
+[[- end]]
+[[- if .HasDB]]
+	"[[.Module]]/services/[[.Name]]/internal/service"
+[[- end]]
+[[- if eq .DB "postgres"]]
+	"[[.Module]]/services/[[.Name]]/ent"
+	pgstore "[[.Module]]/services/[[.Name]]/internal/store/postgres"
+[[- end]]
+[[- if eq .DB "mongo"]]
+	mongostore "[[.Module]]/services/[[.Name]]/internal/store/mongo"
+[[- end]]
+)
+
+// Deps holds lazily created dependencies.
+type Deps struct {
+	a   *app.App
+	cfg config.Config
+
+	mu sync.Mutex
+[[- if eq .DB "postgres"]]
+	db     *postgres.DB
+	client *ent.Client
+	store  *pgstore.Store
+[[- end]]
+[[- if eq .DB "mongo"]]
+	db    *pmongo.DB
+	store *mongostore.Store
+[[- end]]
+[[- if .Redis]]
+	rdb *redis.Client
+[[- end]]
+[[- if .Kafka]]
+	producer *kafka.Producer
+[[- end]]
+}
+
+// New creates an empty dependency set.
+func New(a *app.App, cfg config.Config) *Deps { return &Deps{a: a, cfg: cfg} }
+[[- if eq .DB "postgres"]]
+
+func (d *Deps) postgres(ctx context.Context) (*postgres.DB, *pgstore.Store, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.db != nil {
+		return d.db, d.store, nil
+	}
+	db, err := postgres.Open(ctx, d.cfg.Postgres)
+	if err != nil {
+		return nil, nil, err
+	}
+	d.a.OnClose("postgres", db.Shutdown)
+	d.a.Health.Add("postgres", db.Check)
+	d.db = db
+	d.client = ent.NewClient(ent.Driver(db.Driver()))
+	d.store = pgstore.New(d.client, d.cfg.App.Name)
+	return d.db, d.store, nil
+}
+
+// Store returns the service store.
+func (d *Deps) Store(ctx context.Context) (service.Store, error) {
+	_, s, err := d.postgres(ctx)
+	return s, err
+}
+[[- end]]
+[[- if eq .DB "mongo"]]
+
+func (d *Deps) mongo(ctx context.Context) (*pmongo.DB, *mongostore.Store, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.db != nil {
+		return d.db, d.store, nil
+	}
+	db, err := pmongo.Open(ctx, d.cfg.Mongo)
+	if err != nil {
+		return nil, nil, err
+	}
+	d.a.OnClose("mongo", db.Shutdown)
+	d.a.Health.Add("mongo", db.Check)
+	st := mongostore.New(db, d.cfg.App.Name)
+	if err := st.EnsureIndexes(ctx); err != nil {
+		return nil, nil, err
+	}
+	d.db, d.store = db, st
+	return d.db, d.store, nil
+}
+
+// Store returns the service store.
+func (d *Deps) Store(ctx context.Context) (service.Store, error) {
+	_, s, err := d.mongo(ctx)
+	return s, err
+}
+[[- end]]
+[[- if .Redis]]
+
+// Redis returns the shared Redis client.
+func (d *Deps) Redis(ctx context.Context) (*redis.Client, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.rdb != nil {
+		return d.rdb, nil
+	}
+	rdb, err := redis.Open(ctx, d.cfg.Redis, d.cfg.App.Name)
+	if err != nil {
+		return nil, err
+	}
+	d.a.OnClose("redis", rdb.Shutdown)
+	d.a.Health.Add("redis", rdb.Check)
+	d.rdb = rdb
+	return rdb, nil
+}
+[[- end]]
+[[- if .Kafka]]
+
+// Producer returns the Kafka producer.
+func (d *Deps) Producer() (*kafka.Producer, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.producer != nil {
+		return d.producer, nil
+	}
+	p, err := kafka.NewProducer(d.cfg.Kafka, d.cfg.App.Name)
+	if err != nil {
+		return nil, err
+	}
+	d.a.OnClose("kafka-producer", p.Shutdown)
+	d.a.Health.Add("kafka", p.Check)
+	d.producer = p
+	return p, nil
+}
+[[- end]]
+
+// RunAPI serves the public HTTP API.
+func (d *Deps) RunAPI(ctx context.Context) error {
+	verifier, err := auth.NewVerifier(ctx, d.cfg.Auth, d.cfg.App.Env)
+	if err != nil {
+		return err
+	}
+	authz, err := auth.NewAuthorizer(d.cfg.Auth.Authorizer, d.cfg.App.Env)
+	if err != nil {
+		return err
+	}
+[[- if .HasDB]]
+	store, err := d.Store(ctx)
+	if err != nil {
+		return err
+	}
+[[- end]]
+[[- if .Redis]]
+	rdb, err := d.Redis(ctx)
+	if err != nil {
+		return err
+	}
+[[- end]]
+
+	srv, err := httpserver.New(d.cfg.HTTP, d.cfg.App.Name, d.a.Log)
+	if err != nil {
+		return err
+	}
+	v1 := srv.Engine.Group("/v1",
+		auth.Authenticate(verifier),
+		httpserver.Scope(),
+[[- if .Redis]]
+		idempotency.Middleware(rdb, idempotency.Options{}),
+[[- end]]
+	)
+[[- if .HasDB]]
+	items := service.NewItemService(store[[if .Redis]], redisCache{rdb}[[end]])
+	api.NewHandler(authz, items).Register(v1)
+[[- else]]
+	api.NewHandler(authz).Register(v1)
+[[- end]]
+
+	return srv.Run(ctx, time.Duration(d.cfg.App.ShutdownTimeoutSeconds)*time.Second)
+}
+[[- if .Kafka]]
+[[- if .HasDB]]
+
+// RunRelay publishes outbox rows to Kafka. Run 2 replicas: one leads, the
+// other waits as a hot standby.
+func (d *Deps) RunRelay(ctx context.Context) error {
+	p, err := d.Producer()
+	if err != nil {
+		return err
+	}
+[[- if eq .DB "postgres"]]
+	db, _, err := d.postgres(ctx)
+	if err != nil {
+		return err
+	}
+	relay := outbox.NewRelay(
+		pgoutbox.Store{DB: db.SQL},
+		pgoutbox.Leader{DB: db.SQL, Name: d.cfg.App.Name + "-outbox-relay"},
+		p, d.cfg.Outbox, d.a.Log)
+[[- else]]
+	db, _, err := d.mongo(ctx)
+	if err != nil {
+		return err
+	}
+	relay := outbox.NewRelay(
+		mongooutbox.Store{DB: db.DB},
+		mongooutbox.Leader{DB: db.DB, Name: d.cfg.App.Name + "-outbox-relay"},
+		p, d.cfg.Outbox, d.a.Log)
+[[- end]]
+	return relay.Run(ctx)
+}
+[[- end]]
+
+var retryPolicy = kafka.RetryPolicy{Mode: kafka.RetryTopics}
+
+func (d *Deps) consumerTopics() []string {
+	if len(d.cfg.Consumer.Topics) > 0 {
+		return d.cfg.Consumer.Topics
+	}
+	return events.OwnTopics
+}
+
+// RunConsumer runs the Kafka consumer group(s).
+func (d *Deps) RunConsumer(ctx context.Context) error {
+[[- if .HasDB]]
+	store, err := d.Store(ctx)
+	if err != nil {
+		return err
+	}
+	h := consumer.New(store, d.a.Log)
+[[- else]]
+	h := consumer.New(d.a.Log)
+[[- end]]
+	c, err := kafka.NewConsumer(d.cfg.Kafka, d.cfg.App.Name, kafka.ConsumerOptions{
+		Group:   events.ConsumerGroup,
+		Topics:  d.consumerTopics(),
+		Handler: h.Router().Handler(),
+		Retry:   retryPolicy,
+	}, d.a.Log)
+	if err != nil {
+		return err
+	}
+	return c.Run(ctx)
+}
+
+// CreateTopics creates owned topics plus the consumer's retry/DLT topics.
+// For local development only; in shared environments DevOps creates topics.
+func (d *Deps) CreateTopics(ctx context.Context) error {
+	topics := append(append([]string{}, events.OwnTopics...),
+		kafka.ConsumerTopics(events.ConsumerGroup, d.consumerTopics(), retryPolicy)...)
+	if err := kafka.EnsureTopics(ctx, d.cfg.Kafka, d.cfg.App.Name, topics...); err != nil {
+		return err
+	}
+	d.a.Log.Info("topics ready", "topics", topics)
+	return nil
+}
+[[- end]]
+
+// RunAll runs every mode in one process (local development only).
+func (d *Deps) RunAll(ctx context.Context) error {
+	return app.RunAll(ctx,
+		d.RunAPI,
+[[- if .Kafka]]
+[[- if .HasDB]]
+		d.RunRelay,
+[[- end]]
+		d.RunConsumer,
+[[- end]]
+	)
+}
+[[- if .Redis]]
+
+// redisCache adapts the Redis client to service.Cache.
+type redisCache struct{ c *redis.Client }
+
+func (r redisCache) Get(ctx context.Context, key string, dst any) (bool, error) {
+	return r.c.GetJSON(ctx, r.c.Key(key), dst)
+}
+
+func (r redisCache) Set(ctx context.Context, key string, v any, ttl time.Duration) error {
+	return r.c.SetJSON(ctx, r.c.Key(key), v, ttl)
+}
+
+func (r redisCache) Delete(ctx context.Context, keys ...string) error {
+	full := make([]string, len(keys))
+	for i, k := range keys {
+		full[i] = r.c.Key(k)
+	}
+	return r.c.Del(ctx, full...).Err()
+}
+[[- end]]

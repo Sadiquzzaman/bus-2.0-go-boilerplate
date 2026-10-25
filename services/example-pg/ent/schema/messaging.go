@@ -1,0 +1,17 @@
+package schema
+
+import (
+	"entgo.io/ent"
+
+	"github.com/Sadiquzzaman/bus-2.0-go-boilerplate/platform/postgres/entx"
+)
+
+// OutboxEvent is the transactional outbox table (platform/outbox).
+type OutboxEvent struct{ ent.Schema }
+
+func (OutboxEvent) Mixin() []ent.Mixin { return []ent.Mixin{entx.OutboxMixin{}} }
+
+// ProcessedEvent is the consumer inbox table (platform/inbox).
+type ProcessedEvent struct{ ent.Schema }
+
+func (ProcessedEvent) Mixin() []ent.Mixin { return []ent.Mixin{entx.InboxMixin{}} }

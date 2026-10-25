@@ -1,0 +1,73 @@
+// Package config is the [[.Name]] configuration, read from environment
+// variables (see .env.example). Platform modules bring their own fields; add
+// service-specific settings to Service.
+package config
+
+import (
+	platformconfig "[[.Module]]/platform/config"
+	"[[.Module]]/platform/auth"
+	"[[.Module]]/platform/httpserver"
+	"[[.Module]]/platform/logger"
+	"[[.Module]]/platform/observability"
+[[- if eq .DB "postgres"]]
+	"[[.Module]]/platform/postgres"
+[[- end]]
+[[- if eq .DB "mongo"]]
+	"[[.Module]]/platform/mongo"
+[[- end]]
+[[- if .Redis]]
+	"[[.Module]]/platform/redis"
+[[- end]]
+[[- if .Kafka]]
+	"[[.Module]]/platform/kafka"
+[[- if .HasDB]]
+	"[[.Module]]/platform/outbox"
+[[- end]]
+[[- end]]
+)
+
+// Config is the full service configuration.
+type Config struct {
+	App           platformconfig.App   `envPrefix:"APP_"`
+	Log           logger.Config        `envPrefix:"LOG_"`
+	Observability observability.Config `envPrefix:"OTEL_"`
+	HTTP          httpserver.Config    `envPrefix:"HTTP_"`
+	Auth          auth.Config          `envPrefix:"AUTH_"`
+[[- if eq .DB "postgres"]]
+	Postgres postgres.Config `envPrefix:"POSTGRES_"`
+[[- end]]
+[[- if eq .DB "mongo"]]
+	Mongo mongo.Config `envPrefix:"MONGO_"`
+[[- end]]
+[[- if .Redis]]
+	Redis redis.Config `envPrefix:"REDIS_"`
+[[- end]]
+[[- if .Kafka]]
+	Kafka    kafka.Config `envPrefix:"KAFKA_"`
+	Consumer Consumer     `envPrefix:"CONSUMER_"`
+[[- if .HasDB]]
+	Outbox outbox.RelayConfig `envPrefix:"OUTBOX_"`
+[[- end]]
+[[- end]]
+	Service Service `envPrefix:"SERVICE_"`
+}
+[[- if .Kafka]]
+
+// Consumer configures this service's consumer group.
+type Consumer struct {
+	// Topics to consume. Defaults to this service's own item topic, which
+	// is only useful as a demo — point it at the topics you depend on.
+	Topics []string `env:"TOPICS" envSeparator:","`
+}
+[[- end]]
+
+// Service holds [[.Name]]-specific settings.
+type Service struct {
+	// Add fields here, e.g.:
+	// SeatHoldTTL time.Duration `env:"SEAT_HOLD_TTL" envDefault:"10m"`
+}
+
+// Validate is called by platformconfig.Load.
+func (c Config) Validate() error {
+	return platformconfig.Join(c.Auth[[if .Kafka]], c.Kafka[[end]])
+}

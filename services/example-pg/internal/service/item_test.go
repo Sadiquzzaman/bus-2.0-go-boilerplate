@@ -1,0 +1,123 @@
+package service
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/Sadiquzzaman/bus-2.0-go-boilerplate/platform/apperror"
+	"github.com/Sadiquzzaman/bus-2.0-go-boilerplate/platform/kafka"
+	"github.com/Sadiquzzaman/bus-2.0-go-boilerplate/platform/reqctx"
+
+	"github.com/Sadiquzzaman/bus-2.0-go-boilerplate/services/example-pg/internal/domain"
+	"github.com/Sadiquzzaman/bus-2.0-go-boilerplate/services/example-pg/internal/events"
+)
+
+// fakeStore is an in-memory Store for unit tests.
+type fakeStore struct {
+	mu     sync.Mutex
+	items  map[string]domain.Item
+	events []kafka.Envelope
+	n      int
+}
+
+func newFakeStore() *fakeStore { return &fakeStore{items: map[string]domain.Item{}} }
+
+func (f *fakeStore) Items() ItemRepository { return fakeItems{f} }
+
+func (f *fakeStore) Tx(ctx context.Context, fn func(context.Context, Repos) error) error {
+	return fn(ctx, Repos{Items: fakeItems{f}, Outbox: fakeOutbox{f}})
+}
+
+type fakeItems struct{ f *fakeStore }
+
+func (r fakeItems) Create(ctx context.Context, it domain.Item) (domain.Item, error) {
+	r.f.mu.Lock()
+	defer r.f.mu.Unlock()
+	s, _ := reqctx.ScopeFrom(ctx)
+	r.f.n++
+	it.ID = time.Now().Format("150405.000000") + string(rune('a'+r.f.n))
+	it.CompanyID = s.CompanyID
+	r.f.items[it.ID] = it
+	return it, nil
+}
+
+func (r fakeItems) Get(_ context.Context, id string) (domain.Item, error) {
+	r.f.mu.Lock()
+	defer r.f.mu.Unlock()
+	it, ok := r.f.items[id]
+	if !ok {
+		return domain.Item{}, apperror.NotFound("item not found")
+	}
+	return it, nil
+}
+
+func (r fakeItems) List(context.Context, domain.ItemFilter) ([]domain.Item, int, error) {
+	r.f.mu.Lock()
+	defer r.f.mu.Unlock()
+	out := make([]domain.Item, 0, len(r.f.items))
+	for _, it := range r.f.items {
+		out = append(out, it)
+	}
+	return out, len(out), nil
+}
+
+func (r fakeItems) SetStatus(ctx context.Context, id, status string) (domain.Item, error) {
+	it, err := r.Get(ctx, id)
+	if err != nil {
+		return it, err
+	}
+	r.f.mu.Lock()
+	defer r.f.mu.Unlock()
+	it.Status = status
+	r.f.items[id] = it
+	return it, nil
+}
+
+type fakeOutbox struct{ f *fakeStore }
+
+func (o fakeOutbox) Add(_ context.Context, _ string, envs ...kafka.Envelope) error {
+	o.f.mu.Lock()
+	defer o.f.mu.Unlock()
+	o.f.events = append(o.f.events, envs...)
+	return nil
+}
+
+func scopedCtx() context.Context {
+	return reqctx.WithScope(context.Background(), reqctx.Scope{CompanyID: "0190a8f0-0000-7000-8000-000000000001"})
+}
+
+func TestCreateValidatesName(t *testing.T) {
+	svc := NewItemService(newFakeStore(), nil)
+	_, err := svc.Create(scopedCtx(), CreateItemInput{Name: "   "})
+	if !apperror.Is(err, apperror.CodeValidation) {
+		t.Fatalf("want validation error, got %v", err)
+	}
+}
+
+func TestCreateAndArchive(t *testing.T) {
+	st := newFakeStore()
+	svc := NewItemService(st, nil)
+	ctx := scopedCtx()
+
+	it, err := svc.Create(ctx, CreateItemInput{Name: "Dhaka → Chattogram"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if it.Status != domain.ItemActive {
+		t.Fatalf("status = %s", it.Status)
+	}
+	if _, err := svc.Archive(ctx, it.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Archive(ctx, it.ID); !apperror.Is(err, apperror.CodeConflict) {
+		t.Fatalf("second archive: want conflict, got %v", err)
+	}
+	if len(st.events) != 2 || st.events[0].EventType != events.ItemCreated || st.events[1].EventType != events.ItemArchived {
+		t.Fatalf("unexpected events: %+v", st.events)
+	}
+	if st.events[0].CompanyID != "0190a8f0-0000-7000-8000-000000000001" {
+		t.Fatalf("event not scoped: %+v", st.events[0])
+	}
+}

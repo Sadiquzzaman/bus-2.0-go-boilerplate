@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bus.shohoz.com/contracts/envelope.schema.json",
+  "title": "Event envelope",
+  "description": "JSON value of every Kafka message on every topic. Payload schemas live in contracts/<service>/<event_type>.v<N>.schema.json.",
+  "type": "object",
+  "required": ["event_id", "event_type", "event_version", "occurred_at", "producer", "payload"],
+  "properties": {
+    "event_id":       { "type": "string", "description": "UUIDv7; consumers deduplicate on it" },
+    "event_type":     { "type": "string", "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$", "examples": ["seat.reserved"] },
+    "event_version":  { "type": "integer", "minimum": 1 },
+    "occurred_at":    { "type": "string", "format": "date-time" },
+    "producer":       { "type": "string", "description": "service name" },
+    "aggregate_type": { "type": "string" },
+    "aggregate_id":   { "type": "string", "description": "also the Kafka message key" },
+    "company_id":     { "type": "string" },
+    "vertical_id":    { "type": "string" },
+    "tenant_id":      { "type": "string" },
+    "correlation_id": { "type": "string" },
+    "actor": {
+      "type": "object",
+      "required": ["type", "id"],
+      "properties": {
+        "type": { "enum": ["user", "service", "system"] },
+        "id":   { "type": "string" }
+      }
+    },
+    "payload": { "type": "object" }
+  },
+  "additionalProperties": true
+}

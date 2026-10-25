@@ -1,0 +1,29 @@
+// Atlas versioned migrations for [[.Name]].
+//
+//   make migrate-diff svc=[[.Name]] name=add_seats   # generate SQL from ent schema
+//   make migrate-up   svc=[[.Name]]                  # apply to POSTGRES_DSN
+//
+// Generated files in migrations/ are reviewed in PRs like code. How they are
+// applied in shared environments is up to DevOps. Never edit an applied file.
+
+env "local" {
+  src = "ent://ent/schema"
+  // Throw-away database Atlas uses to compute diffs (needs Docker).
+  dev = "docker://postgres/16/dev?search_path=public"
+  url = getenv("POSTGRES_DSN")
+  migration {
+    dir = "file://migrations"
+  }
+  format {
+    migrate {
+      diff = "{{ sql . \"  \" }}"
+    }
+  }
+}
+
+env "deploy" {
+  url = getenv("POSTGRES_DSN")
+  migration {
+    dir = "file://migrations"
+  }
+}
