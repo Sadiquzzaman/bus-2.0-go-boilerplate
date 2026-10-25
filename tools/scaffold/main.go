@@ -3,8 +3,13 @@
 //	go run ./tools/scaffold -name booking -db postgres -kafka -redis
 //	make new-service name=booking db=postgres kafka=true redis=true
 //
-// db: postgres | mongo | none. The generated service only contains code for
-// what it uses; it imports the shared platform/ packages for everything else.
+// db: postgres | mongo | none | postgres,mongo. The generated service only
+// contains code for what it uses; it imports the shared platform/ packages
+// for everything else.
+//
+// With postgres,mongo, Postgres is the primary database (entities, outbox,
+// inbox) and Mongo is a secondary database for documents (sample: an
+// activity log written by the consumer).
 package main
 
 import (
@@ -17,6 +22,7 @@ import (
 	"go/format"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -30,8 +36,11 @@ var templates embed.FS
 type data struct {
 	Name      string // service name, e.g. "booking"
 	Module    string // Go module path of the repo
-	DB        string // postgres | mongo | none
-	HasDB     bool
+	DB        string // primary database: postgres | mongo | none
+	HasDB     bool   // DB != none
+	Postgres  bool   // Postgres is used
+	Mongo     bool   // Mongo is used (primary or secondary)
+	Both      bool   // Postgres primary + Mongo secondary
 	Kafka     bool
 	Redis     bool
 	Port      int
@@ -44,7 +53,7 @@ var nameRE = regexp.MustCompile(`^[a-z][a-z0-9-]{1,40}[a-z0-9]$`)
 func main() {
 	var (
 		name  = flag.String("name", "", "service name (lowercase, dashes allowed), e.g. booking")
-		db    = flag.String("db", "postgres", "database: postgres | mongo | none")
+		db    = flag.String("db", "postgres", "databases: postgres | mongo | none | postgres,mongo")
 		kafka = flag.Bool("kafka", true, "include Kafka producer (outbox) and consumer")
 		redis = flag.Bool("redis", true, "include Redis (cache, idempotency keys)")
 		port  = flag.Int("port", 0, "local HTTP port (default: next free slot from 8080)")
@@ -62,10 +71,16 @@ func run(root, name, db string, withKafka, withRedis bool, port int, force bool)
 	if !nameRE.MatchString(name) || strings.Contains(name, "--") {
 		return fmt.Errorf("invalid -name %q: use lowercase letters, digits and single dashes", name)
 	}
-	switch db {
-	case "postgres", "mongo", "none":
-	default:
-		return fmt.Errorf("invalid -db %q: postgres | mongo | none", db)
+	usePG, useMongo, err := parseDBs(db)
+	if err != nil {
+		return err
+	}
+	primary := "none"
+	switch {
+	case usePG:
+		primary = "postgres"
+	case useMongo:
+		primary = "mongo"
 	}
 	module, err := readModule(filepath.Join(root, "go.mod"))
 	if err != nil {
@@ -80,7 +95,8 @@ func run(root, name, db string, withKafka, withRedis bool, port int, force bool)
 	}
 
 	d := data{
-		Name: name, Module: module, DB: db, HasDB: db != "none",
+		Name: name, Module: module, DB: primary, HasDB: primary != "none",
+		Postgres: usePG, Mongo: useMongo, Both: usePG && useMongo,
 		Kafka: withKafka, Redis: withRedis,
 		Port: port, AdminPort: port + 1,
 		DBName: strings.ReplaceAll(name, "-", "_"),
@@ -134,9 +150,16 @@ func run(root, name, db string, withKafka, withRedis bool, port int, force bool)
 	for _, w := range written {
 		fmt.Println("  " + w)
 	}
+	if usePG {
+		fmt.Println("\nrunning ent codegen…")
+		gen := exec.Command("go", "generate", "./services/"+name+"/ent")
+		gen.Dir, gen.Stdout, gen.Stderr = root, os.Stdout, os.Stderr
+		if err := gen.Run(); err != nil {
+			fmt.Println("  ent codegen failed — run `make gen` after `make bootstrap`:", err)
+		}
+	}
 	fmt.Println("\nnext steps:")
-	if db == "postgres" {
-		fmt.Printf("  make gen                                  # ent codegen\n")
+	if usePG {
 		fmt.Printf("  make db svc=%s && make migrate-diff svc=%s name=init && make migrate-up svc=%s\n", name, name, name)
 	}
 	fmt.Printf("  cp services/%s/.env.example services/%s/.env\n", name, name)
@@ -158,6 +181,8 @@ func include(rel string, d data) bool {
 		return d.DB == "postgres"
 	case strings.HasPrefix(rel, "internal/store/mongo/"):
 		return d.DB == "mongo"
+	case strings.HasPrefix(rel, "internal/store/activity/"):
+		return d.Both && d.Kafka
 	case strings.HasPrefix(rel, "internal/domain/"), strings.HasPrefix(rel, "internal/service/"):
 		return d.HasDB
 	case strings.HasPrefix(rel, "internal/events/"), strings.HasPrefix(rel, "internal/consumer/"):
@@ -176,6 +201,25 @@ func outputPath(rel string, d data) string {
 		p = filepath.Join(filepath.Dir(p), ".gitkeep")
 	}
 	return p
+}
+
+// parseDBs accepts "none", "postgres", "mongo" or a comma list of the latter two.
+func parseDBs(v string) (pg, mongo bool, err error) {
+	v = strings.ToLower(strings.TrimSpace(v))
+	if v == "" || v == "none" {
+		return false, false, nil
+	}
+	for _, p := range strings.Split(v, ",") {
+		switch strings.TrimSpace(p) {
+		case "postgres", "pg":
+			pg = true
+		case "mongo", "mongodb":
+			mongo = true
+		default:
+			return false, false, fmt.Errorf("invalid -db %q: use postgres, mongo, none or postgres,mongo", v)
+		}
+	}
+	return pg, mongo, nil
 }
 
 func readModule(gomod string) (string, error) {

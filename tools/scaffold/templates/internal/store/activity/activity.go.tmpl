@@ -1,0 +1,59 @@
+// Package activity is a sample of using the service's secondary MongoDB
+// next to Postgres: an append-only activity log of item events.
+//
+// Postgres stays the source of truth (items, outbox, inbox). Use Mongo for
+// what fits documents better: logs, flexible read models, search views.
+// Writes here are not in the Postgres transaction, so keep them idempotent
+// (this log uses the event ID as the document ID).
+package activity
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
+	drv "go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+
+	"[[.Module]]/platform/kafka"
+	pmongo "[[.Module]]/platform/mongo"
+)
+
+const collection = "item_activity"
+
+// Log writes activity documents.
+type Log struct{ coll *drv.Collection }
+
+// New returns the log and makes sure its indexes exist.
+func New(ctx context.Context, db *pmongo.DB) (*Log, error) {
+	coll := db.DB.Collection(collection)
+	_, err := coll.Indexes().CreateOne(ctx, drv.IndexModel{
+		Keys: bson.D{{Key: "company_id", Value: 1}, {Key: "item_id", Value: 1}, {Key: "occurred_at", Value: -1}},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("activity indexes: %w", err)
+	}
+	return &Log{coll: coll}, nil
+}
+
+// Record stores one document per event. A redelivered event updates
+// nothing, because the event ID is the document ID.
+func (l *Log) Record(ctx context.Context, msg *kafka.Message, itemID string) error {
+	_, err := l.coll.UpdateOne(ctx,
+		bson.D{{Key: "_id", Value: msg.EventID}},
+		bson.D{{Key: "$setOnInsert", Value: bson.D{
+			{Key: "company_id", Value: msg.CompanyID},
+			{Key: "item_id", Value: itemID},
+			{Key: "event_type", Value: msg.EventType},
+			{Key: "producer", Value: msg.Producer},
+			{Key: "occurred_at", Value: msg.OccurredAt},
+			{Key: "recorded_at", Value: time.Now().UTC()},
+		}}},
+		options.UpdateOne().SetUpsert(true),
+	)
+	if err != nil {
+		return fmt.Errorf("activity record: %w", err)
+	}
+	return nil
+}

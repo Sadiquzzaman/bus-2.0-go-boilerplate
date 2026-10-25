@@ -12,7 +12,7 @@ import (
 [[- if eq .DB "postgres"]]
 	"[[.Module]]/platform/postgres"
 [[- end]]
-[[- if eq .DB "mongo"]]
+[[- if .Mongo]]
 	"[[.Module]]/platform/mongo"
 [[- end]]
 [[- if .Redis]]
@@ -36,7 +36,7 @@ type Config struct {
 [[- if eq .DB "postgres"]]
 	Postgres postgres.Config `envPrefix:"POSTGRES_"`
 [[- end]]
-[[- if eq .DB "mongo"]]
+[[- if .Mongo]]
 	Mongo mongo.Config `envPrefix:"MONGO_"`
 [[- end]]
 [[- if .Redis]]

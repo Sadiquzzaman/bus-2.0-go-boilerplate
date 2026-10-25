@@ -1,7 +1,16 @@
 # [[.Name]]
 
 Generated from the bus-2.0 Go boilerplate with
-`db=[[.DB]] kafka=[[.Kafka]] redis=[[.Redis]]`.
+`db=[[if .Both]]postgres,mongo[[else]][[.DB]][[end]] kafka=[[.Kafka]] redis=[[.Redis]]`.
+[[- if .Both]]
+
+Postgres is the primary database (entities, outbox, inbox). MongoDB is a
+secondary database, reached with `Deps.Mongo(ctx)` in `internal/bootstrap`;
+it connects only when first used.
+[[- if .Kafka]] The sample `internal/store/activity` writes one Mongo
+document per consumed item event.
+[[- end]]
+[[- end]]
 
 ## Run locally
 
@@ -56,7 +65,7 @@ internal/api/           HTTP handlers, permissions
 [[- if .HasDB]]
 internal/domain/        business types
 internal/service/       business logic (+ unit tests with fakes)
-internal/store/         persistence ([[.DB]])
+internal/store/         persistence ([[.DB]][[if and .Both .Kafka]]; activity/ = Mongo sample[[end]])
 [[- end]]
 [[- if .Kafka]]
 internal/events/        owned topics, event types, payloads

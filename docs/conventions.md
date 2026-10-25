@@ -11,7 +11,7 @@ are reviewed in PRs.
   (timeouts, retries on GET only, circuit breaker, service token, context
   propagation). Prefer keeping a local read model built from events when a read
   is on a hot path.
-- A service owns its database. Nobody else reads or writes its tables or
+- A service owns its databases. Nobody else reads or writes its tables or
   collections.
 
 ## Kafka

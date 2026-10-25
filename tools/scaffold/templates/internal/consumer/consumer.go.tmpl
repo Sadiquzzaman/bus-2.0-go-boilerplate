@@ -14,6 +14,9 @@ import (
 [[- if .HasDB]]
 	"[[.Module]]/services/[[.Name]]/internal/service"
 [[- end]]
+[[- if .Both]]
+	"[[.Module]]/services/[[.Name]]/internal/store/activity"
+[[- end]]
 )
 
 // Handlers processes events this service subscribes to.
@@ -21,12 +24,15 @@ type Handlers struct {
 [[- if .HasDB]]
 	store service.Store
 [[- end]]
+[[- if .Both]]
+	activity *activity.Log
+[[- end]]
 	log *slog.Logger
 }
 
 // New creates the handlers.
-func New([[if .HasDB]]store service.Store, [[end]]log *slog.Logger) *Handlers {
-	return &Handlers{[[if .HasDB]]store: store, [[end]]log: log}
+func New([[if .HasDB]]store service.Store, [[end]][[if .Both]]act *activity.Log, [[end]]log *slog.Logger) *Handlers {
+	return &Handlers{[[if .HasDB]]store: store, [[end]][[if .Both]]activity: act, [[end]]log: log}
 }
 
 // Router maps event types to handlers. Unregistered types are skipped.
@@ -44,7 +50,7 @@ func (h *Handlers) onItem(ctx context.Context, msg *kafka.Message) error {
 		return err // Decode errors are permanent → dead-letter topic
 	}
 [[- if .HasDB]]
-	return h.store.Tx(ctx, func(ctx context.Context, r service.Repos) error {
+	[[if .Both]]err :=[[else]]return[[end]] h.store.Tx(ctx, func(ctx context.Context, r service.Repos) error {
 		dup, err := r.Inbox.Claim(ctx, events.ConsumerGroup, msg.EventID)
 		if err != nil || dup {
 			return err
@@ -54,6 +60,14 @@ func (h *Handlers) onItem(ctx context.Context, msg *kafka.Message) error {
 			slog.String("event_type", msg.EventType), slog.String("item_id", p.ID), slog.String("producer", msg.Producer))
 		return nil
 	})
+[[- if .Both]]
+	if err != nil {
+		return err
+	}
+	// Secondary database: an activity document per event. Keyed by
+	// event_id, so a redelivered message does not create a duplicate.
+	return h.activity.Record(ctx, msg, p.ID)
+[[- end]]
 [[- else]]
 	h.log.InfoContext(ctx, "item event received",
 		slog.String("event_type", msg.EventType), slog.String("item_id", p.ID), slog.String("producer", msg.Producer))
