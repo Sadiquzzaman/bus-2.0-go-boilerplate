@@ -1,0 +1,192 @@
+// Package mongo implements service.Store on MongoDB.
+package mongo
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	drv "go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+
+	"github.com/Sadiquzzaman/bus-2.0-go-boilerplate/platform/apperror"
+	"github.com/Sadiquzzaman/bus-2.0-go-boilerplate/platform/inbox/mongoinbox"
+	"github.com/Sadiquzzaman/bus-2.0-go-boilerplate/platform/kafka"
+	pmongo "github.com/Sadiquzzaman/bus-2.0-go-boilerplate/platform/mongo"
+	"github.com/Sadiquzzaman/bus-2.0-go-boilerplate/platform/outbox/mongooutbox"
+	"github.com/Sadiquzzaman/bus-2.0-go-boilerplate/platform/reqctx"
+
+	"github.com/Sadiquzzaman/bus-2.0-go-boilerplate/services/example-mongo/internal/domain"
+	"github.com/Sadiquzzaman/bus-2.0-go-boilerplate/services/example-mongo/internal/service"
+)
+
+const itemsCollection = "items"
+
+// Store implements service.Store.
+type Store struct {
+	db     *pmongo.DB
+	outbox mongooutbox.Writer
+}
+
+// New creates the store. serviceName is the producer name stamped on events.
+func New(db *pmongo.DB, serviceName string) *Store {
+	return &Store{db: db, outbox: mongooutbox.Writer{Service: serviceName, DB: db.DB}}
+}
+
+// EnsureIndexes creates collection indexes. Safe to run on every start.
+func (s *Store) EnsureIndexes(ctx context.Context) error {
+	_, err := s.db.DB.Collection(itemsCollection).Indexes().CreateMany(ctx, []drv.IndexModel{
+		{Keys: bson.D{{Key: "company_id", Value: 1}, {Key: "status", Value: 1}, {Key: "created_at", Value: -1}}},
+		{Keys: bson.D{{Key: "company_id", Value: 1}, {Key: "vertical_id", Value: 1}, {Key: "tenant_id", Value: 1}}},
+	})
+	if err != nil {
+		return fmt.Errorf("items indexes: %w", err)
+	}
+	if err := mongooutbox.EnsureIndexes(ctx, s.db.DB, 7*24*time.Hour); err != nil {
+		return err
+	}
+	if err := mongoinbox.EnsureIndexes(ctx, s.db.DB, 30*24*time.Hour); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Items returns a repository outside any transaction.
+func (s *Store) Items() service.ItemRepository {
+	return itemRepo{coll: s.db.DB.Collection(itemsCollection)}
+}
+
+// Tx runs fn in a multi-document transaction. The driver may re-run fn on
+// transient errors, so fn must not have side effects outside the database.
+func (s *Store) Tx(ctx context.Context, fn func(ctx context.Context, r service.Repos) error) error {
+	return s.db.WithTx(ctx, func(ctx context.Context) error {
+		return fn(ctx, service.Repos{
+			Items:  s.Items(),
+			Outbox: txOutbox{w: s.outbox},
+			Inbox:  txInbox{db: s.db},
+		})
+	})
+}
+
+type txOutbox struct{ w mongooutbox.Writer }
+
+func (o txOutbox) Add(ctx context.Context, topic string, envs ...kafka.Envelope) error {
+	return o.w.Add(ctx, topic, envs...)
+}
+
+type txInbox struct{ db *pmongo.DB }
+
+func (i txInbox) Claim(ctx context.Context, group, eventID string) (bool, error) {
+	return mongoinbox.Claim(ctx, i.db.DB, group, eventID)
+}
+
+type itemDoc struct {
+	ID          string    `bson:"_id"`
+	CompanyID   string    `bson:"company_id"`
+	VerticalID  string    `bson:"vertical_id,omitempty"`
+	TenantID    string    `bson:"tenant_id,omitempty"`
+	Name        string    `bson:"name"`
+	Description string    `bson:"description,omitempty"`
+	Status      string    `bson:"status"`
+	CreatedAt   time.Time `bson:"created_at"`
+	UpdatedAt   time.Time `bson:"updated_at"`
+}
+
+func (d itemDoc) toDomain() domain.Item {
+	return domain.Item{
+		ID: d.ID, CompanyID: d.CompanyID, VerticalID: d.VerticalID, TenantID: d.TenantID,
+		Name: d.Name, Description: d.Description, Status: d.Status,
+		CreatedAt: d.CreatedAt, UpdatedAt: d.UpdatedAt,
+	}
+}
+
+// itemRepo scopes every call with pmongo.Scoped.
+type itemRepo struct{ coll *drv.Collection }
+
+func (r itemRepo) Create(ctx context.Context, in domain.Item) (domain.Item, error) {
+	s, ok := reqctx.ScopeFrom(ctx)
+	if !ok || s.CompanyID == "" {
+		return domain.Item{}, pmongo.ErrMissingScope
+	}
+	now := time.Now().UTC()
+	d := itemDoc{
+		ID: uuid.Must(uuid.NewV7()).String(), CompanyID: s.CompanyID, VerticalID: s.VerticalID, TenantID: s.TenantID,
+		Name: in.Name, Description: in.Description, Status: in.Status, CreatedAt: now, UpdatedAt: now,
+	}
+	if _, err := r.coll.InsertOne(ctx, d); err != nil {
+		if pmongo.IsDuplicateKey(err) {
+			return domain.Item{}, apperror.Conflict("item already exists")
+		}
+		return domain.Item{}, err
+	}
+	return d.toDomain(), nil
+}
+
+func (r itemRepo) Get(ctx context.Context, id string) (domain.Item, error) {
+	f, err := pmongo.Scoped(ctx, bson.D{{Key: "_id", Value: id}})
+	if err != nil {
+		return domain.Item{}, err
+	}
+	var d itemDoc
+	if err := r.coll.FindOne(ctx, f).Decode(&d); err != nil {
+		if pmongo.IsNotFound(err) {
+			return domain.Item{}, apperror.NotFound("item not found")
+		}
+		return domain.Item{}, err
+	}
+	return d.toDomain(), nil
+}
+
+func (r itemRepo) List(ctx context.Context, f domain.ItemFilter) ([]domain.Item, int, error) {
+	q := bson.D{}
+	if f.Status != "" {
+		q = append(q, bson.E{Key: "status", Value: f.Status})
+	}
+	if !f.WholeCompany {
+		q = append(q, pmongo.VisibleTo(f.VerticalIDs, f.TenantIDs))
+	}
+	filter, err := pmongo.Scoped(ctx, q)
+	if err != nil {
+		return nil, 0, err
+	}
+	total, err := r.coll.CountDocuments(ctx, filter)
+	if err != nil {
+		return nil, 0, err
+	}
+	cur, err := r.coll.Find(ctx, filter, options.Find().
+		SetSort(bson.D{{Key: "created_at", Value: -1}, {Key: "_id", Value: -1}}).
+		SetSkip(int64(f.Offset)).SetLimit(int64(f.Limit)))
+	if err != nil {
+		return nil, 0, err
+	}
+	var docs []itemDoc
+	if err := cur.All(ctx, &docs); err != nil {
+		return nil, 0, err
+	}
+	out := make([]domain.Item, len(docs))
+	for i, d := range docs {
+		out[i] = d.toDomain()
+	}
+	return out, int(total), nil
+}
+
+func (r itemRepo) SetStatus(ctx context.Context, id, status string) (domain.Item, error) {
+	f, err := pmongo.Scoped(ctx, bson.D{{Key: "_id", Value: id}})
+	if err != nil {
+		return domain.Item{}, err
+	}
+	var d itemDoc
+	err = r.coll.FindOneAndUpdate(ctx, f,
+		bson.D{{Key: "$set", Value: bson.D{{Key: "status", Value: status}, {Key: "updated_at", Value: time.Now().UTC()}}}},
+		options.FindOneAndUpdate().SetReturnDocument(options.After),
+	).Decode(&d)
+	if err != nil {
+		if pmongo.IsNotFound(err) {
+			return domain.Item{}, apperror.NotFound("item not found")
+		}
+		return domain.Item{}, err
+	}
+	return d.toDomain(), nil
+}

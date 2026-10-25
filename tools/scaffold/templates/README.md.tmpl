@@ -1,0 +1,73 @@
+# [[.Name]]
+
+Generated from the bus-2.0 Go boilerplate with
+`db=[[.DB]] kafka=[[.Kafka]] redis=[[.Redis]]`.
+
+## Run locally
+
+```bash
+make up                                   # postgres, mongo, kafka, redis (repo root)
+cp services/[[.Name]]/.env.example services/[[.Name]]/.env
+[[- if eq .DB "postgres"]]
+make db svc=[[.Name]]                     # create the database
+make migrate-diff svc=[[.Name]] name=init # first time only: generate SQL from the ent schema
+make migrate-up svc=[[.Name]]
+[[- end]]
+[[- if .Kafka]]
+make run svc=[[.Name]] mode=topics        # create Kafka topics
+[[- end]]
+make run svc=[[.Name]] mode=all           # API[[if and .Kafka .HasDB]] + outbox relay[[end]][[if .Kafka]] + consumer[[end]]
+```
+
+API on `http://localhost:[[.Port]]`, health/metrics on `http://localhost:[[.AdminPort]]`.
+[[- if .HasDB]]
+
+```bash
+CID=0190a8f0-0000-7000-8000-000000000001
+curl -s -X POST localhost:[[.Port]]/v1/items \
+  -H "X-Company-ID: $CID" -H "Content-Type: application/json" \
+  -H "Idempotency-Key: $(uuidgen)" \
+  -d '{"name":"Dhaka → Chattogram"}'
+curl -s localhost:[[.Port]]/v1/items -H "X-Company-ID: $CID"
+```
+[[- end]]
+
+## Run modes
+
+| Mode | What it runs |
+|---|---|
+| `api` | public HTTP API on `HTTP_ADDR` |
+[[- if and .Kafka .HasDB]]
+| `relay` | outbox → Kafka publisher (leader-elected) |
+[[- end]]
+[[- if .Kafka]]
+| `consumer` | Kafka consumer group `[[.Name]].item-events` |
+| `topics` | create Kafka topics (local only) |
+[[- end]]
+| `all` | everything in one process (local only) |
+
+## Layout
+
+```
+cmd/[[.Name]]/          main: config, run modes
+internal/config/        env configuration
+internal/bootstrap/     dependency wiring per run mode
+internal/api/           HTTP handlers, permissions
+[[- if .HasDB]]
+internal/domain/        business types
+internal/service/       business logic (+ unit tests with fakes)
+internal/store/         persistence ([[.DB]])
+[[- end]]
+[[- if .Kafka]]
+internal/events/        owned topics, event types, payloads
+internal/consumer/      Kafka handlers
+[[- end]]
+[[- if eq .DB "postgres"]]
+ent/schema/             ent schema (run `make gen` after changes)
+migrations/             Atlas SQL migrations
+[[- end]]
+```
+
+The `Item` entity is a sample. Replace it with your own entities and keep
+the patterns: company scoping, outbox events, inbox claims, status
+instead of delete, permission check per record.
